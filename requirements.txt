@@ -1,0 +1,8 @@
+ccxt
+pandas
+scikit-learn
+dash
+plotly
+requests
+playwright
+python-dotsenv
