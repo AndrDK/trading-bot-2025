@@ -1,0 +1,198 @@
+cat > trading_bot_2025.py << 'EOF'
+import ccxt, pandas as pd, time, requests
+from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+import dash
+from dash import dcc, html, Input, Output
+import plotly.graph_objs as go
+
+exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+MIN_CONFIDENCE = 0.68
+COLORS = {"BTC/USDT": "#f7931a", "ETH/USDT": "#627eea", "SOL/USDT": "#a77bff"}
+NAMES = {"BTC/USDT": "Bitcoin", "ETH/USDT": "Ethereum", "SOL/USDT": "Solana"}
+
+class Agent:
+    def __init__(self):
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.last_train = 0
+
+    def fear_greed(self):
+        try:
+            return int(requests.get("https://api.alternative.me/fng/?limit=1",timeout=5).json()['data'][0]['value'])
+        except: return 50
+
+    def create_features(self, df):
+        close = df['close']
+        delta = close.diff()
+        up = delta.clip(lower=0)
+        down = -delta.clip(upper=0)
+        rs = up.rolling(14).mean() / down.rolling(14).mean()
+        df['rsi'] = 100 - (100 / (1 + rs))
+        df['ema12'] = close.ewm(span=12).mean()
+        df['ema26'] = close.ewm(span=26).mean()
+        df['macd'] = df['ema12'] - df['ema26']
+        roll = close.rolling(20)
+        df['bb_upper'] = roll.mean() + 2*roll.std()
+        df['bb_lower'] = roll.mean() - 2*roll.std()
+        return df.dropna()
+
+    def train(self, sym):
+        raw = exchange.fetch_ohlcv(sym.replace("/", ""), '1h', limit=500)
+        df = pd.DataFrame(raw, columns=['ts','o','h','l','c','v'])
+        df['close'] = df['c']
+        df = self.create_features(df)
+        if len(df) < 20: return
+        X = df[['rsi','macd']].values[:-1]
+        y = (df['close'].shift(-1) > df['close']).astype(int).values[:-1]
+        X_scaled = self.scaler.fit_transform(X)
+        model = RandomForestRegressor(n_estimators=500, max_depth=14, random_state=42, n_jobs=-1)
+        model.fit(X_scaled, y)
+        self.models[sym] = model
+
+    def predict(self, sym):
+        if time.time() - self.last_train > 21600:
+            for s in SYMBOLS: self.train(s)
+            self.last_train = time.time()
+            print("MODELS RETRAINED")
+
+        raw = exchange.fetch_ohlcv(sym.replace("/", ""), '1h', limit=100)
+        df = pd.DataFrame(raw, columns=['ts','o','h','l','c','v'])
+        df['close'] = df['c']
+        df = self.create_features(df).tail(1)
+        if df.empty or sym not in self.models: return None, 0.5, False
+
+        X = self.scaler.transform(df[['rsi','macd']].values)
+        prob = self.models[sym].predict(X)[0]
+        price = df['close'].iloc[-1]
+        fg = self.fear_greed()
+
+        conf = prob
+        bb_signal = False
+        if price <= df['bb_lower'].iloc[-1] * 1.01:
+            conf += 0.25
+            bb_signal = True
+        if price >= df['bb_upper'].iloc[-1] * 0.99:
+            conf -= 0.25
+
+        conf += (100 - fg) / 500
+        conf = max(0.01, min(0.99, conf))
+
+        if conf >= MIN_CONFIDENCE:
+            return "LONG", conf, bb_signal
+        if conf <= 1 - MIN_CONFIDENCE:
+            return "SHORT", 1-conf, bb_signal
+        return None, conf, False
+
+agent = Agent()
+for s in SYMBOLS: agent.train(s)
+
+portfolio = {"USDT": 100000.0}
+positions = {}
+trades = []
+total_pnl = 0.0
+
+def open_position(sym, side, conf, bb_signal):
+    global total_pnl
+    price = exchange.fetch_ticker(sym.replace("/", ""))['last']
+    size = 0.02
+    if portfolio["USDT"] < price * size: return
+
+    if sym in positions:
+        pos = positions.pop(sym)
+        pnl = (price - pos["entry"]) * pos["size"] if pos["side"] == "LONG" else (pos["entry"] - price) * pos["size"]
+        portfolio["USDT"] += price * pos["size"] + pnl
+        total_pnl += pnl
+        trades.append(f"CLOSE {sym.split('/')[0]} → PnL {pnl:+,.0f} USDT")
+
+    portfolio["USDT"] -= price * size
+    positions[sym] = {"side": side, "size": size, "entry": price}
+    bb_text = " [BB]" if bb_signal else ""
+    trades.append(f"OPEN {side} {sym.split('/')[0]} @ {price:,.0f} | {conf:.1%}{bb_text}")
+    print(f"OPEN {side} {sym.split('/')[0]} @ {price:,.0f} | {conf:.1%}{bb_text}")
+
+app = dash.Dash(__name__)
+app.title = "TRADING BOT 2025"
+
+app.layout = html.Div(style={'backgroundColor':'#000','color':'lime','fontFamily':'Courier New','padding':'20px'}, children=[
+    html.H1("TRADING BOT 2025 – LIVE", style={'textAlign':'center','fontSize':72,'marginBottom':'30px'}),
+
+    html.Div(style={'textAlign':'center','fontSize':48,'fontWeight':'bold'}, children=[
+        html.Div(id="capital"),
+        html.Div(id="total-pnl", style={'marginTop':'10px','color':'yellow'})
+    ]),
+
+    html.Div(style={'display':'grid','gridTemplateColumns':'repeat(3,1fr)','gap':'20px','margin':'40px 0'}, children=[
+        html.Div([dcc.Graph(id=f'chart-{sym.split("/")[0]}', style={'height':'400px'})]) for sym in SYMBOLS
+    ]),
+
+    html.Div(style={'display':'flex','justifyContent':'space-around','margin':'30px 0'}, children=[
+        html.Div([html.Div(f"{sym.split('/')[0]} Preis",style={'fontSize':32,'color':COLORS[sym]}),
+                  html.Div(id=f"price-{sym.split('/')[0]}",style={'fontSize':52,'fontWeight':'bold','color':COLORS[sym]}),
+                  html.Div(id=f"conf-{sym.split('/')[0]}",style={'fontSize':28,'marginTop':'10px'})], style={'textAlign':'center'}) 
+        for sym in SYMBOLS
+    ]),
+
+    html.Div(id="positions", style={'margin':'40px','fontSize':30,'backgroundColor':'#111','padding':'25px','borderRadius':'15px','minHeight':'100px'}),
+    html.Div(style={'textAlign':'center','margin':'30px'}, children=[html.Div(id="fg", style={'fontSize':42,'fontWeight':'bold'})]),
+    html.Div(id="log", style={'margin':'30px','fontSize':26,'lineHeight':'1.8','backgroundColor':'#111','padding':'25px','borderRadius':'15px'}),
+    dcc.Interval(id='interval', interval=30*1000, n_intervals=0)
+])
+
+@app.callback(
+    [Output(f'chart-{sym.split("/")[0]}','figure') for sym in SYMBOLS] +
+    [Output('capital','children'), Output('total-pnl','children'), Output('positions','children'),
+     Output('fg','children'), Output('log','children')] +
+    [Output(f"price-{sym.split('/')[0]}",'children') for sym in SYMBOLS] +
+    [Output(f"conf-{sym.split('/')[0]}",'children') for sym in SYMBOLS],
+    Input('interval','n_intervals')
+)
+def update(n):
+    confidences = {}
+    for sym in SYMBOLS:
+        result = agent.predict(sym)
+        sig, conf, bb_signal = result[0], result[1], result[2]
+        confidences[sym] = conf
+        if sig and (sym not in positions or positions[sym]["side"] != sig):
+            open_position(sym, sig, conf, bb_signal)
+
+    charts = []
+    prices = {}
+    for sym in SYMBOLS:
+        raw = exchange.fetch_ohlcv(sym.replace("/", ""), '1h', limit=150)
+        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','vol'])
+        df['time'] = pd.to_datetime(df['ts'], unit='ms')
+        fig = go.Figure(go.Candlestick(x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+                                       increasing_line_color=COLORS[sym], decreasing_line_color=COLORS[sym]))
+        fig.update_layout(template="plotly_dark", margin=dict(t=30,r=20,b=20,l=40), height=400,
+                          title=f"{sym.split('/')[0]} / USDT – 1h Candles", xaxis_rangeslider_visible=False)
+        charts.append(fig)
+        prices[sym] = exchange.fetch_ticker(sym.replace("/", ""))['last']
+
+    unreal = sum((exchange.fetch_ticker(s.replace("/", ""))['last'] - positions[s]["entry"]) * positions[s]["size"]
+                 if positions[s]["side"]=="LONG" else (positions[s]["entry"] - exchange.fetch_ticker(s.replace("/", ""))['last']) * positions[s]["size"]
+                 for s in positions)
+    total = portfolio["USDT"] + unreal
+    fg = agent.fear_greed()
+
+    pos_lines = [html.Div(f"{s.split('/')[0]} → {p['side']} @ {p['entry']:,.0f} → {exchange.fetch_ticker(s.replace('/', ''))['last']:,.0f} | P&L {((exchange.fetch_ticker(s.replace('/', ''))['last']-p['entry'])*p['size'] if p['side']=='LONG' else (p['entry']-exchange.fetch_ticker(s.replace('/', ''))['last'])*p['size']):+,.0f} USDT",
+                          style={'color':'lime' if ((exchange.fetch_ticker(s.replace('/', ''))['last']-p['entry'])*p['size'] if p['side']=='LONG' else (p['entry']-exchange.fetch_ticker(s.replace('/', ''))['last'])*p['size'])>=0 else 'red','margin':'8px 0','fontSize':28})
+                 for s,p in positions.items()]
+
+    conf_texts = [f"Confidence: {confidences[sym]:.1%} → {'LONG' if confidences[sym] >= MIN_CONFIDENCE else 'WAIT'}" for sym in SYMBOLS]
+
+    return (*charts,
+            f"KAPITAL: {total:,.0f} USDT │ Unrealized: {unreal:+,.0f} USDT",
+            f"TOTAL REALIZED P&L: {total_pnl:+,.0f} USDT",
+            pos_lines or html.Div("Keine offenen Positionen", style={'color':'gray','fontStyle':'italic','fontSize':32}),
+            f"FEAR & GREED: {fg} → {'EXTREME FEAR' if fg<25 else 'FEAR' if fg<45 else 'GREED' if fg>80 else 'NEUTRAL'}",
+            html.Ul([html.Li(t) for t in trades[-20:]]),
+            *[f"{prices[sym]:,.0f}" for sym in SYMBOLS],
+            *conf_texts)
+
+if __name__ == '__main__':
+    print("TRADING BOT 2025 – 3 SEPARATE CHARTS + KORREKTE USDT → http://127.0.0.1:8050")
+    app.run(host='0.0.0.0', port=8050, debug=False)
+EOF
