@@ -4,5 +4,4 @@ scikit-learn
 dash
 plotly
 requests
-playwright
 python-dotenv
